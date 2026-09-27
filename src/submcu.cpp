@@ -1281,6 +1281,12 @@ void SM_HandleInterrupt(void)
 {
     if (sm.sr & SM_STATUS_I)
         return;
+
+    // Every source below except the collision one needs its enable and
+    // request bits both set
+    if ((sm_device_mode[SM_DEV_INT_ENABLE] & sm_device_mode[SM_DEV_INT_REQUEST]) == 0
+        && (sm_device_mode[SM_DEV_COLLISION] & 0xc0) != 0xc0)
+        return;
     
     if ((sm_device_mode[SM_DEV_UART1_CTRL] & 0x8) != 0
         && (sm_device_mode[SM_DEV_INT_ENABLE] & 0x80) != 0
@@ -1359,6 +1365,26 @@ void SM_HandleInterrupt(void)
 
 void SM_UpdateTimer(void)
 {
+    if (sm_timer_cycles >= sm.cycles)
+        return;
+
+    // Ticks until sm_timer_cycles >= sm.cycles, 16 cycles each
+    uint64_t n = (sm.cycles - sm_timer_cycles + 15) >> 4;
+
+    // Stopped, or the prescaler does not reach 0 within these ticks: the
+    // same result as stepping tick by tick
+    if ((sm_device_mode[SM_DEV_TIMER_CTRL] & 0x20) != 0 || sm.sleep)
+    {
+        sm_timer_cycles += n * 16;
+        return;
+    }
+    if (sm_timer_prescaler >= n)
+    {
+        sm_timer_prescaler -= (uint8_t)n;
+        sm_timer_cycles += n * 16;
+        return;
+    }
+
     while (sm_timer_cycles < sm.cycles)
     {
         if ((sm_device_mode[SM_DEV_TIMER_CTRL] & 0x20) == 0 && !sm.sleep)
