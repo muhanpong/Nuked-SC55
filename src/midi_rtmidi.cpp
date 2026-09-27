@@ -29,7 +29,18 @@ int MIDI_Init(int port)
         return 0; // Already running
     }
 
-    s_midi_in = new RtMidiIn(RtMidi::UNSPECIFIED, "Nuked SC55", 1024);
+    try
+    {
+        s_midi_in = new RtMidiIn(RtMidi::UNSPECIFIED, "Nuked SC55", 1024);
+    }
+    catch (const RtMidiError &e)
+    {
+        // e.g. no ALSA sequencer (snd-seq not loaded)
+        fprintf(stderr, "RtMidi: %s\n", e.getMessage().c_str());
+        fflush(stderr);
+        s_midi_in = nullptr;
+        return 0;
+    }
     s_midi_in->ignoreTypes(false, false, false); // SysEx disabled by default
     s_midi_in->setCallback(&MidiOnReceive, nullptr); // FIXME: (local bug) Fix the linking error
     s_midi_in->setErrorCallback(&MidiOnError, nullptr);

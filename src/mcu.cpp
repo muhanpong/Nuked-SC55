@@ -16,8 +16,20 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include <ctype.h>
+#include <vector>
+#ifdef NUKED_HEADLESS
+#include <stdlib.h>
+#include <signal.h>
+#include <atomic>
+#include <chrono>
+#include <mutex>
+#include <thread>
+#include <alsa/asoundlib.h>
+#else
 #define SDL_MAIN_HANDLED
 #include "SDL.h"
+#endif
 #include "mcu.h"
 #include "mcu_opcodes.h"
 #include "mcu_interrupt.h"
@@ -132,7 +144,22 @@ static short *sample_buffer;
 static int sample_read_ptr;
 static int sample_write_ptr;
 
+#ifdef NUKED_HEADLESS
+static snd_pcm_t *alsa_pcm;
+static std::thread alsa_thread;
+static std::atomic<bool> alsa_thread_run(false);
+static std::atomic<bool> quit_requested(false);
+
+// -bench:<seconds>: render without audio output as fast as possible,
+// playing a dense chord pattern on all 16 parts, and report the speed
+static uint64_t bench_frames_target = 0;
+static uint64_t bench_frames = 0;
+static uint32_t bench_rate = 0;
+static int bench_peak = 0;
+static FILE *bench_dump = NULL;
+#else
 static SDL_AudioDeviceID sdl_audio;
+#endif
 
 void MCU_ErrorTrap(void)
 {
@@ -159,7 +186,11 @@ static uint8_t ad_nibble = 0x00;
 static uint8_t sw_pos = 3;
 static uint8_t io_sd = 0x00;
 
+#ifdef NUKED_HEADLESS
+std::atomic<int> mcu_button_pressed(0);
+#else
 SDL_atomic_t mcu_button_pressed = { 0 };
+#endif
 
 uint8_t RCU_Read(void)
 {
@@ -445,7 +476,7 @@ uint8_t MCU_DeviceRead(uint32_t address)
         if (!mcu_jv880) return 0xff;
 
         uint8_t data = 0xff;
-        uint32_t button_pressed = (uint32_t)SDL_AtomicGet(&mcu_button_pressed);
+        uint32_t button_pressed = MCU_ButtonsGet();
 
         if (io_sd == 0b11111011)
             data &= ((button_pressed >> 0) & 0b11111) ^ 0xFF;
@@ -623,7 +654,7 @@ uint8_t MCU_Read(uint32_t address)
                     LCD_Enable((io_sd & 8) != 0);
 
                     uint8_t data = 0xff;
-                    uint32_t button_pressed = (uint32_t)SDL_AtomicGet(&mcu_button_pressed);
+                    uint32_t button_pressed = MCU_ButtonsGet();
 
                     if ((io_sd & 1) == 0)
                         data &= ((button_pressed >> 0) & 255) ^ 255;
@@ -984,6 +1015,27 @@ void MCU_UpdateUART_TX(void)
 
 static bool work_thread_run = false;
 
+#ifdef NUKED_HEADLESS
+static std::mutex work_thread_lock;
+
+void MCU_WorkThread_Lock(void)
+{
+    work_thread_lock.lock();
+}
+
+void MCU_WorkThread_Unlock(void)
+{
+    work_thread_lock.unlock();
+}
+
+static void MCU_Sleep(int ms)
+{
+    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+}
+
+int work_thread(void* /*data*/)
+{
+#else
 static SDL_mutex *work_thread_lock;
 
 void MCU_WorkThread_Lock(void)
@@ -996,9 +1048,15 @@ void MCU_WorkThread_Unlock(void)
     SDL_UnlockMutex(work_thread_lock);
 }
 
+static void MCU_Sleep(int ms)
+{
+    SDL_Delay(ms);
+}
+
 int SDLCALL work_thread(void* data)
 {
     work_thread_lock = SDL_CreateMutex();
+#endif
 
     MCU_WorkThread_Lock();
     while (work_thread_run)
@@ -1007,12 +1065,16 @@ int SDLCALL work_thread(void* data)
             sample_write_ptr &= ~3;
         else
             sample_write_ptr &= ~1;
+#ifdef NUKED_HEADLESS
+        if (bench_frames_target == 0 && sample_read_ptr == sample_write_ptr)
+#else
         if (sample_read_ptr == sample_write_ptr)
+#endif
         {
             MCU_WorkThread_Unlock();
-            while (sample_read_ptr == sample_write_ptr)
+            while (sample_read_ptr == sample_write_ptr && work_thread_run)
             {
-                SDL_Delay(1);
+                MCU_Sleep(1);
             }
             MCU_WorkThread_Lock();
         }
@@ -1059,11 +1121,34 @@ int SDLCALL work_thread(void* data)
     }
     MCU_WorkThread_Unlock();
 
+#ifndef NUKED_HEADLESS
     SDL_DestroyMutex(work_thread_lock);
+#endif
 
     return 0;
 }
 
+#ifdef NUKED_HEADLESS
+static void MCU_SignalHandler(int /*sig*/)
+{
+    quit_requested = true;
+}
+
+static void MCU_Run()
+{
+    signal(SIGINT, MCU_SignalHandler);
+    signal(SIGTERM, MCU_SignalHandler);
+
+    work_thread_run = true;
+    std::thread thread(work_thread, (void*)NULL);
+
+    while (!quit_requested)
+        MCU_Sleep(15);
+
+    work_thread_run = false;
+    thread.join();
+}
+#else
 static void MCU_Run()
 {
     bool working = true;
@@ -1083,6 +1168,7 @@ static void MCU_Run()
     work_thread_run = false;
     SDL_WaitThread(thread, 0);
 }
+#endif
 
 void MCU_PatchROM(void)
 {
@@ -1102,7 +1188,7 @@ uint8_t MCU_ReadP0(void)
 uint8_t MCU_ReadP1(void)
 {
     uint8_t data = 0xff;
-    uint32_t button_pressed = (uint32_t)SDL_AtomicGet(&mcu_button_pressed);
+    uint32_t button_pressed = MCU_ButtonsGet();
 
     if ((mcu_p0_data & 1) == 0)
         data &= ((button_pressed >> 0) & 255) ^ 255;
@@ -1155,6 +1241,105 @@ void unscramble(uint8_t *src, uint8_t *dst, int len)
     }
 }
 
+#ifdef NUKED_HEADLESS
+static void alsa_audio_thread(int chunk)
+{
+    short *buf = (short*)malloc(chunk * sizeof(short));
+    if (!buf)
+        return;
+
+    while (alsa_thread_run)
+    {
+        memcpy(buf, &sample_buffer[sample_read_ptr], chunk * sizeof(short));
+        memset(&sample_buffer[sample_read_ptr], 0, chunk * sizeof(short));
+        sample_read_ptr = (sample_read_ptr + chunk) % audio_buffer_size;
+
+        short *p = buf;
+        snd_pcm_uframes_t frames = chunk / 2;
+        while (frames > 0 && alsa_thread_run)
+        {
+            snd_pcm_sframes_t written = snd_pcm_writei(alsa_pcm, p, frames);
+            if (written < 0)
+            {
+                written = snd_pcm_recover(alsa_pcm, (int)written, 1);
+                if (written < 0)
+                {
+                    fprintf(stderr, "ALSA: write failed: %s\n", snd_strerror((int)written));
+                    fflush(stderr);
+                    alsa_thread_run = false;
+                    quit_requested = true;
+                }
+                continue;
+            }
+            p += written * 2;
+            frames -= written;
+        }
+    }
+
+    free(buf);
+}
+
+int MCU_OpenAudio(const char *deviceName, int pageSize, int pageNum)
+{
+    audio_page_size = (pageSize/2)*2; // must be even
+    audio_buffer_size = audio_page_size*pageNum;
+
+    unsigned int rate = (mcu_mk1 || mcu_jv880) ? 64000 : 66207;
+    // Same chunk the SDL callback would consume: page_size/4 stereo frames
+    int chunk = audio_page_size / 2;
+    // Let ALSA buffer about half of the ring
+    unsigned int latency_us = (unsigned int)((uint64_t)(audio_buffer_size / 4) * 1000000 / rate);
+
+    sample_buffer = (short*)calloc(audio_buffer_size, sizeof(short));
+    if (!sample_buffer)
+    {
+        printf("Cannot allocate audio buffer.\n");
+        return 0;
+    }
+    sample_read_ptr = 0;
+    sample_write_ptr = 0;
+
+    int err = snd_pcm_open(&alsa_pcm, deviceName, SND_PCM_STREAM_PLAYBACK, 0);
+    if (err < 0)
+    {
+        printf("ALSA: cannot open '%s': %s\n", deviceName, snd_strerror(err));
+        return 0;
+    }
+
+    err = snd_pcm_set_params(alsa_pcm, SND_PCM_FORMAT_S16, SND_PCM_ACCESS_RW_INTERLEAVED,
+                             2, rate, 1, latency_us);
+    if (err < 0)
+    {
+        printf("ALSA: cannot set parameters: %s\n", snd_strerror(err));
+        snd_pcm_close(alsa_pcm);
+        alsa_pcm = NULL;
+        return 0;
+    }
+
+    printf("Audio device: %s\n", deviceName);
+    printf("Audio: F=S16, C=2, R=%u, chunk=%d frames, latency=%u us\n", rate, chunk / 2, latency_us);
+    fflush(stdout);
+
+    alsa_thread_run = true;
+    alsa_thread = std::thread(alsa_audio_thread, chunk);
+
+    return 1;
+}
+
+void MCU_CloseAudio(void)
+{
+    alsa_thread_run = false;
+    if (alsa_thread.joinable())
+        alsa_thread.join();
+    if (alsa_pcm)
+    {
+        snd_pcm_drop(alsa_pcm);
+        snd_pcm_close(alsa_pcm);
+        alsa_pcm = NULL;
+    }
+    if (sample_buffer) free(sample_buffer);
+}
+#else
 void audio_callback(void* /*userdata*/, Uint8* stream, int len)
 {
     len /= 2;
@@ -1261,9 +1446,65 @@ void MCU_CloseAudio(void)
     SDL_CloseAudio();
     if (sample_buffer) free(sample_buffer);
 }
+#endif
+
+#ifdef NUKED_HEADLESS
+static void bench_post_midi(void)
+{
+    // New chord every 0.25 s of audio after 2 s of boot time: releases the
+    // previous chord and plays 3 notes on each of the 16 parts (48 notes,
+    // more than the polyphony, so every voice stays busy).
+    uint64_t step = bench_rate / 4;
+    uint64_t boot = (uint64_t)bench_rate * 2;
+    if (bench_frames < boot || (bench_frames - boot) % step != 0)
+        return;
+
+    uint64_t n = (bench_frames - boot) / step;
+    static const uint8_t chords[4][3] = { {48, 55, 64}, {50, 57, 65}, {52, 59, 67}, {53, 60, 69} };
+    for (int ch = 0; ch < 16; ch++)
+    {
+        if (n > 0)
+        {
+            const uint8_t *prev = chords[(n - 1) % 4];
+            for (int k = 0; k < 3; k++)
+            {
+                MCU_PostUART(0x80 | ch);
+                MCU_PostUART(prev[k] + (ch == 9 ? 0 : ch % 3 * 12));
+                MCU_PostUART(0);
+            }
+        }
+        const uint8_t *cur = chords[n % 4];
+        for (int k = 0; k < 3; k++)
+        {
+            MCU_PostUART(0x90 | ch);
+            MCU_PostUART(cur[k] + (ch == 9 ? 0 : ch % 3 * 12));
+            MCU_PostUART(100);
+        }
+    }
+}
+#endif
 
 void MCU_PostSample(int *sample)
 {
+#ifdef NUKED_HEADLESS
+    if (bench_frames_target)
+    {
+        if (bench_frames >= bench_frames_target)
+            return; // second oversampled sample after the last one
+        bench_post_midi();
+        int l = abs(sample[0] >> 15), r = abs(sample[1] >> 15);
+        if (l > bench_peak) bench_peak = l;
+        if (r > bench_peak) bench_peak = r;
+        if (bench_dump)
+        {
+            int16_t out[2] = { (int16_t)(sample[0] >> 15), (int16_t)(sample[1] >> 15) };
+            fwrite(out, sizeof(out), 1, bench_dump);
+        }
+        if (++bench_frames >= bench_frames_target)
+            work_thread_run = false;
+        return;
+    }
+#endif
     sample[0] >>= 15;
     if (sample[0] > INT16_MAX)
         sample[0] = INT16_MAX;
@@ -1347,13 +1588,110 @@ void MIDI_Reset(ResetType resetType)
 
 }
 
+#ifdef NUKED_HEADLESS
+static std::string ini_trim(const std::string &str)
+{
+    size_t b = str.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos)
+        return "";
+    size_t e = str.find_last_not_of(" \t\r\n");
+    return str.substr(b, e - b + 1);
+}
+
+// Reads key = value lines and turns them into the equivalent command line
+// options, so the regular option parser handles both.
+static void ini_load_args(const std::string &path, std::vector<std::string> &args)
+{
+    FILE *f = Files::utf8_fopen(path.c_str(), "r");
+    if (!f)
+    {
+        printf("Config: %s not found, using defaults\n", path.c_str());
+        return;
+    }
+    printf("Config: %s\n", path.c_str());
+
+    char line[1024];
+    int lineNum = 0;
+    while (fgets(line, sizeof(line), f))
+    {
+        lineNum++;
+        std::string l = ini_trim(line);
+        if (l.empty() || l[0] == '#' || l[0] == ';' || l[0] == '[')
+            continue;
+
+        size_t eq = l.find('=');
+        if (eq == std::string::npos)
+        {
+            fprintf(stderr, "Config: line %d: expected key = value\n", lineNum);
+            continue;
+        }
+        std::string key = ini_trim(l.substr(0, eq));
+        std::string value = ini_trim(l.substr(eq + 1));
+        for (size_t i = 0; i < key.size(); i++)
+            key[i] = (char)tolower((unsigned char)key[i]);
+        if (value.empty())
+            continue;
+
+        if (key == "rom_dir")
+            args.push_back("-rom:" + value);
+        else if (key == "romset")
+        {
+            if (value != "auto")
+                args.push_back("-" + value);
+        }
+        else if (key == "audio_device")
+            args.push_back("-ad:" + value);
+        else if (key == "audio_buffer")
+            args.push_back("-ab:" + value);
+        else if (key == "midi_port")
+            args.push_back("-p:" + value);
+        else if (key == "reset")
+        {
+            if (value != "none")
+                args.push_back("-" + value);
+        }
+        else
+            fprintf(stderr, "Config: line %d: unknown key '%s'\n", lineNum, key.c_str());
+    }
+    fclose(f);
+}
+#endif
+
 int main(int argc, char *argv[])
 {
     (void)argc;
     std::string basePath;
+    std::string romDir;
+
+#ifdef NUKED_HEADLESS
+    // INI options go first so the command line overrides them
+    std::string iniPath = NUKED_DEFAULT_INI;
+    for (int i = 1; i < argc; i++)
+    {
+        if (!strncmp(argv[i], "-ini:", 5))
+            iniPath = argv[i] + 5;
+    }
+
+    std::vector<std::string> allArgs;
+    allArgs.push_back(argv[0]);
+    allArgs.push_back(std::string("-rom:") + NUKED_DEFAULT_ROM_DIR);
+    ini_load_args(iniPath, allArgs);
+    for (int i = 1; i < argc; i++)
+        allArgs.push_back(argv[i]);
+
+    std::vector<char*> allArgv;
+    for (size_t i = 0; i < allArgs.size(); i++)
+        allArgv.push_back(&allArgs[i][0]);
+    argc = (int)allArgv.size();
+    argv = allArgv.data();
+#endif
 
     int port = 0;
     int audioDeviceIndex = -1;
+#ifdef NUKED_HEADLESS
+    const char *alsaDevice = "default";
+    int benchSeconds = 0;
+#endif
     int pageSize = 512;
     int pageNum = 32;
     bool autodetect = true;
@@ -1368,6 +1706,30 @@ int main(int argc, char *argv[])
             {
                 port = atoi(argv[i] + 3);
             }
+#ifdef NUKED_HEADLESS
+            else if (!strncmp(argv[i], "-ad:", 4))
+            {
+                alsaDevice = argv[i] + 4;
+            }
+#endif
+            else if (!strncmp(argv[i], "-rom:", 5))
+            {
+                romDir = argv[i] + 5;
+            }
+#ifdef NUKED_HEADLESS
+            else if (!strncmp(argv[i], "-ini:", 5))
+            {
+                // handled before this loop
+            }
+            else if (!strncmp(argv[i], "-bench:", 7))
+            {
+                benchSeconds = atoi(argv[i] + 7);
+            }
+            else if (!strncmp(argv[i], "-benchdump:", 11))
+            {
+                bench_dump = fopen(argv[i] + 11, "wb");
+            }
+#endif
             else if (!strncmp(argv[i], "-a:", 3))
             {
                 audioDeviceIndex = atoi(argv[i] + 3);
@@ -1444,7 +1806,17 @@ int main(int argc, char *argv[])
                 printf("  -h, -help, --help              Display this information.\n");
                 printf("\n");
                 printf("  -p:<port_number>               Set MIDI port.\n");
+                printf("  -rom:<directory>               Set ROM directory.\n");
+#ifdef NUKED_HEADLESS
+                printf("  -ini:<file>                    Set config file (default: " NUKED_DEFAULT_INI ").\n");
+                printf("  -bench:<seconds>               Render <seconds> of audio without output and report speed.\n");
+                printf("  -benchdump:<file>              With -bench, also write the raw S16 stereo output to <file>.\n");
+#endif
+#ifdef NUKED_HEADLESS
+                printf("  -ad:<alsa_device>              Set ALSA output device (default: \"default\").\n");
+#else
                 printf("  -a:<device_number>             Set Audio Device index.\n");
+#endif
                 printf("  -ab:<page_size>:[page_count]   Set Audio Buffer size.\n");
                 printf("\n");
                 printf("  -mk2                           Use SC-55mk2 ROM set.\n");
@@ -1488,6 +1860,10 @@ int main(int argc, char *argv[])
 
     if(Files::dirExists(basePath + "/../share/nuked-sc55"))
         basePath += "/../share/nuked-sc55";
+
+    if (!romDir.empty())
+        basePath = romDir;
+    printf("ROM directory: %s\n", basePath.c_str());
 
     if (autodetect)
     {
@@ -1718,6 +2094,37 @@ int main(int argc, char *argv[])
     // Close all files as they no longer needed being open
     closeAllR();
 
+#ifdef NUKED_HEADLESS
+    (void)audioDeviceIndex;
+    if (benchSeconds > 0)
+    {
+        MCU_Init();
+        MCU_PatchROM();
+        MCU_Reset();
+        SM_Reset();
+        PCM_Reset();
+        if (resetType != ResetType::NONE) MIDI_Reset(resetType);
+
+        bench_rate = (mcu_mk1 || mcu_jv880) ? 64000 : 66207;
+        bench_frames_target = (uint64_t)benchSeconds * bench_rate;
+        printf("Bench: rendering %d s at %u Hz...\n", benchSeconds, bench_rate);
+        fflush(stdout);
+
+        auto t0 = std::chrono::steady_clock::now();
+        work_thread_run = true;
+        work_thread(NULL);
+        double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+
+        double audio = (double)bench_frames / bench_rate;
+        printf("Bench: %.2f s audio in %.2f s wall = %.1f%% of realtime (%s)\n",
+               audio, wall, audio / wall * 100.0, audio >= wall ? "keeps up" : "TOO SLOW");
+        printf("Bench: output peak %d (0 = silence, check ROMs/MIDI)\n", bench_peak);
+        if (bench_dump)
+            fclose(bench_dump);
+        return 0;
+    }
+    if (!MCU_OpenAudio(alsaDevice, pageSize, pageNum))
+#else
     if (SDL_Init(SDL_INIT_AUDIO | SDL_INIT_VIDEO | SDL_INIT_TIMER) < 0)
     {
         fprintf(stderr, "FATAL ERROR: Failed to initialize the SDL2: %s.\n", SDL_GetError());
@@ -1726,6 +2133,7 @@ int main(int argc, char *argv[])
     }
 
     if (!MCU_OpenAudio(audioDeviceIndex, pageSize, pageNum))
+#endif
     {
         fprintf(stderr, "FATAL ERROR: Failed to open the audio stream.\n");
         fflush(stderr);
@@ -1752,7 +2160,9 @@ int main(int argc, char *argv[])
     MCU_CloseAudio();
     MIDI_Quit();
     LCD_UnInit();
+#ifndef NUKED_HEADLESS
     SDL_Quit();
+#endif
 
     return 0;
 }

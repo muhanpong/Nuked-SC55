@@ -18,7 +18,11 @@
 
 #include <stdint.h>
 #include "mcu_interrupt.h"
+#ifdef NUKED_HEADLESS
+#include <atomic>
+#else
 #include "SDL_atomic.h"
+#endif
 
 enum {
     DEV_P1DDR = 0x00,
@@ -436,7 +440,13 @@ extern int mcu_jv880;
 extern int mcu_scb55;
 extern int mcu_sc155;
 
+#ifdef NUKED_HEADLESS
+extern std::atomic<int> mcu_button_pressed;
+#define MCU_ButtonsGet() ((uint32_t)mcu_button_pressed.load())
+#else
 extern SDL_atomic_t mcu_button_pressed;
+#define MCU_ButtonsGet() ((uint32_t)SDL_AtomicGet(&mcu_button_pressed))
+#endif
 
 static const uint32_t uart_buffer_size = 8192;
 extern uint32_t uart_write_ptr;

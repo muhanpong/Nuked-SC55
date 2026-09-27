@@ -176,7 +176,14 @@ if(NOT WIN32 AND PKG_CONFIG_FOUND)
     option(USE_SYSTEM_RTMIDI "Use system libraries for RtMidi" OFF)
 endif()
 
-find_package(SDL2 REQUIRED)
+option(NUKED_HEADLESS "Build without SDL2: no LCD window, ALSA audio output, INI config (Linux only)" OFF)
+
+if(NUKED_HEADLESS)
+    find_package(ALSA REQUIRED)
+    find_package(Threads REQUIRED)
+else()
+    find_package(SDL2 REQUIRED)
+endif()
 
 if(USE_RTMIDI)
     if(USE_SYSTEM_RTMIDI)
@@ -189,7 +196,7 @@ endif()
 
 set(SC55_SRC
     src/mcu.cpp src/mcu.h # main() is here!
-    src/lcd.cpp src/lcd.h src/lcd_font.h
+    src/lcd.h
     src/mcu_interrupt.cpp src/mcu_interrupt.h
     src/mcu_opcodes.cpp src/mcu_opcodes.h
     src/mcu_timer.cpp src/mcu_timer.h
@@ -199,6 +206,12 @@ set(SC55_SRC
 
     src/utils/files.cpp src/utils/files.h
 )
+
+if(NUKED_HEADLESS)
+    list(APPEND SC55_SRC src/lcd_headless.cpp)
+else()
+    list(APPEND SC55_SRC src/lcd.cpp src/lcd_font.h)
+endif()
 
 if(USE_RTMIDI)
     list(APPEND SC55_SRC src/midi_rtmidi.cpp)
@@ -213,7 +226,15 @@ if(MSVC)
     target_compile_definitions(nuked-sc55 PRIVATE WIN32_CONSOLE)
 endif()
 
-if(TARGET SDL2::SDL2)
+if(NUKED_HEADLESS)
+    set(NUKED_DEFAULT_ROM_DIR "/media/fat/nuked-sc55" CACHE STRING "Headless: default ROM directory")
+    set(NUKED_DEFAULT_INI "/media/fat/linux/nuked-sc55.ini" CACHE STRING "Headless: default config file")
+    target_compile_definitions(nuked-sc55 PRIVATE NUKED_HEADLESS
+        NUKED_DEFAULT_ROM_DIR="${NUKED_DEFAULT_ROM_DIR}"
+        NUKED_DEFAULT_INI="${NUKED_DEFAULT_INI}")
+    target_include_directories(nuked-sc55 PRIVATE ${ALSA_INCLUDE_DIRS})
+    target_link_libraries(nuked-sc55 PRIVATE ${ALSA_LIBRARIES} Threads::Threads)
+elseif(TARGET SDL2::SDL2)
     target_link_libraries(nuked-sc55 PRIVATE SDL2::SDL2)
 else()
     string(STRIP ${SDL2_LIBRARIES} SDL2_LIBRARIES)
