@@ -24,6 +24,9 @@
 #include "mcu.h"
 #include "mcu_interrupt.h"
 #include "pcm.h"
+#if defined(__ARM_FEATURE_SAT)
+#include <arm_acle.h>
+#endif
 
 pcm_t pcm;
 uint8_t waverom1[0x200000];
@@ -317,27 +320,23 @@ void PCM_Reset(void)
 
 inline uint32_t addclip20(uint32_t add1, uint32_t add2, uint32_t cin)
 {
-    uint32_t sum = (add1 + add2 + cin) & 0xfffff;
-    if ((add1 & 0x80000) != 0 && (add2 & 0x80000) != 0 && (sum & 0x80000) == 0)
-        sum = 0x80000;
-    else if ((add1 & 0x80000) == 0 && (add2 & 0x80000) == 0 && (sum & 0x80000) != 0)
-        sum = 0x7ffff;
-    return sum;
+    // same result as the bit-19 overflow checks: saturate the signed sum
+    // to 20 bits (SSAT #20 on ARM)
+    int32_t s = ((int32_t)(add1 << 12) >> 12) + ((int32_t)(add2 << 12) >> 12) + (int32_t)cin;
+#if defined(__ARM_FEATURE_SAT)
+    s = __ssat(s, 20);
+#else
+    s = s > 0x7ffff ? 0x7ffff : s;
+    s = s < -0x80000 ? -0x80000 : s;
+#endif
+    return (uint32_t)s & 0xfffff;
 }
 
 inline int32_t multi(int32_t val1, int8_t val2)
 {
-    if (val1 & 0x80000)
-        val1 |= ~0xfffff;
-    else
-        val1 &= 0x7ffff;
-
-    val1 *= val2;
-    if (val1 & 0x8000000)
-        val1 |= ~0x1ffffff;
-    else
-        val1 &= 0x1ffffff;
-    return val1;
+    // sign-extend from bit 19, multiply, keep 25 bits with the sign of the product
+    int32_t p = ((int32_t)((uint32_t)val1 << 12) >> 12) * val2;
+    return (p & 0x1ffffff) | ((p >> 31) & ~0x1ffffff);
 }
 
 static const int interp_lut[3][128] = {
@@ -481,6 +480,97 @@ inline void calc_tv(int e, int adjust, uint16_t *levelcur, int active, int *volm
     }
 }
 
+// table-driven calc_tv: per-speed constants precomputed once, per-sample
+// addlow/write flags precomputed from tv_counter once per sample
+struct tv_speed_t { uint8_t sel, t8, shift_a, shift_b; int32_t pre_b; };
+static tv_speed_t tv_speed[256];
+static int tv_addlow[5], tv_write[5];
+static void calc_tv_init(void)
+{
+    static int done;
+    if (done) return;
+    done = 1;
+    for (int speed = 0; speed < 256; speed++)
+    {
+        int w1 = (speed & 0xf0) == 0;
+        int w2 = w1 || (speed & 0x10) != 0;
+        int w3n = ((speed & 0x80) == 0 || ((speed & 0x40) == 0 && (!w2 || (speed & 0x20) == 0)));
+        int type = w2;
+        if (speed & 0x20) type |= 2;
+        if ((speed & 0x80) == 0 || (speed & 0x40) == 0) type |= 4;
+        tv_speed_t &t = tv_speed[speed];
+        t.sel = (type & 4) ? 4 : (type & 3);
+        t.t8 = w3n;
+        t.shift_a = (10 - (speed & 15)) & 15;
+        int sh = ((speed >> 4) & 14) | w2;
+        t.shift_b = (10 - sh) & 15;
+        int pre = (speed & 15) << 9;
+        if (!w1) pre |= 0x2000;
+        t.pre_b = pre;
+    }
+}
+static inline void calc_tv_sample(void)
+{
+    static const uint8_t rev4[16] = {
+        0x0, 0x8, 0x4, 0xc, 0x2, 0xa, 0x6, 0xe, 0x1, 0x9, 0x5, 0xd, 0x3, 0xb, 0x7, 0xf
+    };
+    static const uint8_t addlow_shift[5] = { 2, 4, 6, 8, 0 };
+    static const uint8_t write_mask[5] = { 3, 15, 63, 127, 0 };
+    for (int i = 0; i < 5; i++)
+    {
+        tv_addlow[i] = rev4[(pcm.tv_counter >> addlow_shift[i]) & 15];
+        tv_write[i] = (pcm.tv_counter & write_mask[i]) == 0;
+    }
+}
+// valid only when pcm.nfs == 1
+template <int e>
+static inline __attribute__((always_inline)) void calc_tv_fast(int adjust, uint16_t *levelcur_p, int active, int *volmul)
+{
+    int levelcur = *levelcur_p & 0x7fff;
+    int speed = adjust & 0xff;
+    int target = (adjust >> 8) & 0xff;
+    const tv_speed_t &t = tv_speed[speed];
+    int write = !active | tv_write[t.sel];
+    int addlow = tv_addlow[t.sel];
+    int use_level = (e != 2) || active;
+    if (!t.t8)
+    {
+        int sum1 = target << 11;
+        if (use_level)
+            sum1 -= levelcur << 4;
+        int shifted = (sum1 >> t.shift_a) - sum1;
+        int sum2 = (target << 11) + addlow + shifted;
+        if (write)
+            levelcur = (sum2 >> 4) & 0x7fff;
+        if (e != 2)
+            *volmul = (sum2 >> 4) & 0x7ffe;
+    }
+    else
+    {
+        int sum1 = target << 11;
+        if (use_level)
+            sum1 -= levelcur << 4;
+        int neg = (sum1 & 0x80000) != 0;
+        int preshift = t.pre_b;
+        if (neg)
+            preshift ^= ~0x3f;
+        int sum2 = preshift >> t.shift_b;
+        if (use_level)
+            sum2 += (levelcur << 4) | addlow;
+        int sum2_l = sum2 >> 4;
+        int sum3 = (target << 11) - (sum2_l << 4);
+        int neg2 = (sum3 & 0x80000) != 0;
+        int xnor = !(neg2 ^ neg);
+        if (e == 0)
+            *volmul = sum2_l & 0x7ffe;
+        else if (e == 1)
+            *volmul = xnor ? (sum2_l & 0x7ffe) : (target << 7);
+        if (write)
+            levelcur = xnor ? (sum2_l & 0x7fff) : (target << 7);
+    }
+    *levelcur_p = levelcur;
+}
+
 inline int eram_unpack(int addr, int type = 0)
 {
     addr &= 0x3fff;
@@ -516,6 +606,7 @@ inline void eram_pack(int addr, int val)
 void PCM_Update(uint64_t cycles)
 {
     PCM_UpdateROMBanks();
+    calc_tv_init();
     int reg_slots = (pcm.config_reg_3d & 31) + 1;
     int voice_active = pcm.voice_mask & pcm.voice_mask_pending;
     while (pcm.cycles < cycles)
@@ -640,6 +731,7 @@ void PCM_Update(uint64_t cycles)
 
             pcm.tv_counter &= 0x3fff;
         }
+        calc_tv_sample();
 
         // chorus/reverb
 
@@ -1098,6 +1190,43 @@ void PCM_Update(uint64_t cycles)
             int okey = (ram2[7] & 0x20) != 0;
             int key = (voice_active >> slot) & 1;
 
+#ifndef NO_IDLE_SKIP
+            if (!key && pcm.nfs && slot != 31) // row 31 aliases the L/R bus
+            {
+                // idle slot: pan = rc = 0 so its sample contributes nothing;
+                // all state it writes is zeroed below except ram2[11]
+                calc_tv_fast<2>(ram2[5], &ram2[11], 0, NULL);
+                int slot2 = (slot == reg_slots - 1) ? 31 : slot + 1;
+                switch (slot2)
+                {
+                    case 17: pcm.ram1[31][1] = addclip20(pcm.ram1[31][1], rcadd[0] >> 1, rcadd[0] & 1);
+                        pcm.rcsum[1] = addclip20(pcm.rcsum[1], rcadd2[0] >> 1, rcadd2[0] & 1); break;
+                    case 18: pcm.ram1[31][3] = addclip20(pcm.ram1[31][3], rcadd[1] >> 1, rcadd[1] & 1);
+                        pcm.rcsum[1] = addclip20(pcm.rcsum[1], rcadd2[1] >> 1, rcadd2[1] & 1); break;
+                    case 21: pcm.ram1[31][1] = addclip20(pcm.ram1[31][1], rcadd[2] >> 1, rcadd[2] & 1);
+                        pcm.rcsum[0] = addclip20(pcm.rcsum[0], rcadd2[2] >> 1, rcadd2[2] & 1); break;
+                    case 22: pcm.ram1[31][3] = addclip20(pcm.ram1[31][3], rcadd[3] >> 1, rcadd[3] & 1);
+                        pcm.rcsum[1] = addclip20(pcm.rcsum[1], rcadd2[3] >> 1, rcadd2[3] & 1); break;
+                    case 23: pcm.ram1[31][1] = addclip20(pcm.ram1[31][1], rcadd[4] >> 1, rcadd[4] & 1);
+                        pcm.rcsum[0] = addclip20(pcm.rcsum[0], rcadd2[4] >> 1, rcadd2[4] & 1); break;
+                    case 31: pcm.ram1[31][3] = addclip20(pcm.ram1[31][3], rcadd[5] >> 1, rcadd[5] & 1);
+                        pcm.rcsum[1] = addclip20(pcm.rcsum[1], rcadd2[5] >> 1, rcadd2[5] & 1); break;
+                }
+                if (slot == reg_slots - 1)
+                {
+                    pcm.accum_l = pcm.ram1[31][1];
+                    pcm.accum_r = pcm.ram1[31][3];
+                }
+                ram1[1] = 0;
+                ram1[3] = 0;
+                ram1[5] = 0;
+                ram2[8] = 0;
+                ram2[9] = 0;
+                ram2[10] = 0;
+                continue;
+            }
+#endif
+
             int active = okey && key;
             int kon = key && !okey;
 
@@ -1125,26 +1254,37 @@ void PCM_Update(uint64_t cycles)
                 irq_flag = ((address + ((-address_loop) & 0xfffff)) & 0x100000) != 0;
             irq_flag ^= b7;
 
-            int nibble_address = (!b6 && nibble_cmp1) ? address_loop : address; // 3
-            int address_b4 = (nibble_address & 0x10) != 0;
-            int wave_address = nibble_address >> 5;
-            int xor2 = (address_b4 ^ b7);
-            int check1 = xor2 && active;
-            int xor1 = (b15 ^ !nibble_cmp1);
-            int nibble_add = b6 ? check1 && xor1 : (!nibble_cmp1 && check1);
-            int nibble_subtract = b6 && !xor1 && active && !xor2;
-            if (b7)
-                wave_address -= nibble_add - nibble_subtract;
-            else
-                wave_address += nibble_add - nibble_subtract;
-            wave_address &= 0xfffff;
+            int fast_d = ((b6 && b15) ? -1 : 1) * (b7 ? -1 : 1);
+            int fast_t = b15 ? address_loop : address_end;
+            int fast_dist = ((fast_t - address) * fast_d) & 0xfffff;
+            int fast = !kon && (b6 || !b15) && fast_dist >= 4;
+            // fast path and a1..a4 all in the same 16-sample block as address:
+            // every nibble_cmp is 1 and usenew is 0, so newnibble is never used
+            int skip_nib = fast && (fast_d > 0 ? (address & 15) <= 11 : (address & 15) >= 4);
+            int newnibble = 0;
+            if (!skip_nib)
+            {
+                int nibble_address = (!b6 && nibble_cmp1) ? address_loop : address; // 3
+                int address_b4 = (nibble_address & 0x10) != 0;
+                int wave_address = nibble_address >> 5;
+                int xor2 = (address_b4 ^ b7);
+                int check1 = xor2 && active;
+                int xor1 = (b15 ^ !nibble_cmp1);
+                int nibble_add = b6 ? check1 && xor1 : (!nibble_cmp1 && check1);
+                int nibble_subtract = b6 && !xor1 && active && !xor2;
+                if (b7)
+                    wave_address -= nibble_add - nibble_subtract;
+                else
+                    wave_address += nibble_add - nibble_subtract;
+                wave_address &= 0xfffff;
 
-            int newnibble = PCM_ReadROMFast((hiaddr << 20) | wave_address);
-            int newnibble_sel = address_b4 ^ ((b6 || !nibble_cmp1) && okey);
-            if (newnibble_sel)
-                newnibble = (newnibble >> 4) & 15;
-            else
-                newnibble &= 15;
+                newnibble = PCM_ReadROMFast((hiaddr << 20) | wave_address);
+                int newnibble_sel = address_b4 ^ ((b6 || !nibble_cmp1) && okey);
+                if (newnibble_sel)
+                    newnibble = (newnibble >> 4) & 15;
+                else
+                    newnibble &= 15;
+            }
 
             int sub_phase = (ram2[8] & 0x3fff); // 1
             int interp_ratio = (sub_phase >> 7) & 127;
@@ -1157,130 +1297,167 @@ void PCM_Update(uint64_t cycles)
             }
 
 
-            // address 0
-            int address_cnt = address;
-            int samp0 = (int8_t)PCM_ReadROMFast((hiaddr << 20) | address_cnt); // 18
-
-            cmp1 = address;
-            cmp2 = address_cnt;
-            int nibble_cmp2 = (cmp1 & 0xffff0) == (cmp2 & 0xffff0); // 8
-            cmp1 = b15 ? address_loop : address_end;
-            cmp2 = address_cnt;
-            int address_cmp = (cmp1 & 0xfffff) == (cmp2 & 0xfffff); // 9
-
-            int next_address = address_cnt; // 11
-            int usenew = !nibble_cmp2;
-            int next_b15 = b15;
-
-            cmp1 = (!b6 && address_cmp) ? address_loop : address_cnt;
-            cmp2 = address_cnt;
-            int address_cnt2 = (kon || (!b6 && address_cmp)) ? cmp1 : cmp2;
-
-            int address_add = (!address_cmp && b6 && !b15) || (!address_cmp && !b6);
-            int address_sub = !address_cmp && b6 && b15;
-            if (b7)
-                address_cnt2 -= address_add - address_sub;
-            else
-                address_cnt2 += address_add - address_sub;
-            address_cnt = address_cnt2 & 0xfffff; // 11
-            b15 = b6 && (b15 ^ address_cmp); // 11
-
-            int samp1 = (int8_t)PCM_ReadROMFast((hiaddr << 20) | address_cnt); // 20
-
-            cmp1 = address;
-            cmp2 = address_cnt;
-            int nibble_cmp3 = (cmp1 & 0xffff0) == (cmp2 & 0xffff0); // 12
-            cmp1 = b15 ? address_loop : address_end;
-            cmp2 = address_cnt;
-            address_cmp = (cmp1 & 0xfffff) == (cmp2 & 0xfffff); // 13
-
-            if (sub_phase_of >= 1)
+            int samp0, samp1, samp2, samp3;
+            int nibble_cmp2, nibble_cmp3, nibble_cmp4, nibble_cmp5, nibble_cmp6;
+            int next_address, usenew, next_b15;
+#ifndef NO_ADDR_FAST
+            if (fast)
             {
-                next_address = address_cnt; // 13
-                usenew = !nibble_cmp3;
+                // no loop/end compare hits in the 4 steps: plain +-1 stepping
+                int a1 = (address + fast_d) & 0xfffff;
+                int a2 = (address + 2 * fast_d) & 0xfffff;
+                int a3 = (address + 3 * fast_d) & 0xfffff;
+                int a4 = (address + 4 * fast_d) & 0xfffff;
+                int hi = hiaddr << 20;
+                samp0 = (int8_t)PCM_ReadROMFast(hi | address);
+                samp1 = (int8_t)PCM_ReadROMFast(hi | a1);
+                samp2 = (int8_t)PCM_ReadROMFast(hi | a2);
+                samp3 = (int8_t)PCM_ReadROMFast(hi | a3);
+                nibble_cmp2 = 1;
+                nibble_cmp3 = ((address ^ a1) & 0xffff0) == 0;
+                nibble_cmp4 = ((address ^ a2) & 0xffff0) == 0;
+                nibble_cmp5 = ((address ^ a3) & 0xffff0) == 0;
+                nibble_cmp6 = ((address ^ a4) & 0xffff0) == 0;
                 next_b15 = b15;
+                switch (sub_phase_of)
+                {
+                    case 0: next_address = address; usenew = 0; break;
+                    case 1: next_address = a1; usenew = !nibble_cmp3; break;
+                    case 2: next_address = a2; usenew = !nibble_cmp4; break;
+                    case 3: next_address = a3; usenew = !nibble_cmp5; break;
+                    default: next_address = a4; usenew = !nibble_cmp6; break;
+                }
             }
-
-            cmp1 = (!b6 && address_cmp) ? address_loop : address_cnt;
-            cmp2 = address_cnt;
-            address_cnt2 = (kon || (!b6 && address_cmp)) ? cmp1 : cmp2;
-
-            address_add = (!address_cmp && b6 && !b15) || (!address_cmp && !b6);
-            address_sub = !address_cmp && b6 && b15;
-            if (b7)
-                address_cnt2 -= address_add - address_sub;
             else
-                address_cnt2 += address_add - address_sub;
-            address_cnt = address_cnt2 & 0xfffff; // 15
-            b15 = b6 && (b15 ^ address_cmp); // 15
-
-            int samp2 = (int8_t)PCM_ReadROMFast((hiaddr << 20) | address_cnt); // 1
-
-            cmp1 = address;
-            cmp2 = address_cnt;
-            int nibble_cmp4 = (cmp1 & 0xffff0) == (cmp2 & 0xffff0); // 16
-            cmp1 = b15 ? address_loop : address_end;
-            cmp2 = address_cnt;
-            address_cmp = (cmp1 & 0xfffff) == (cmp2 & 0xfffff); // 17
-
-            if (sub_phase_of >= 2)
+#endif
             {
-                next_address = address_cnt; // 17
-                usenew = !nibble_cmp4;
+                // address 0
+                int address_cnt = address;
+                samp0 = (int8_t)PCM_ReadROMFast((hiaddr << 20) | address_cnt); // 18
+
+                cmp1 = address;
+                cmp2 = address_cnt;
+                nibble_cmp2 = (cmp1 & 0xffff0) == (cmp2 & 0xffff0); // 8
+                cmp1 = b15 ? address_loop : address_end;
+                cmp2 = address_cnt;
+                int address_cmp = (cmp1 & 0xfffff) == (cmp2 & 0xfffff); // 9
+
+                next_address = address_cnt; // 11
+                usenew = !nibble_cmp2;
                 next_b15 = b15;
-            }
 
-            cmp1 = (!b6 && address_cmp) ? address_loop : address_cnt;
-            cmp2 = address_cnt;
-            address_cnt2 = (kon || (!b6 && address_cmp)) ? cmp1 : cmp2;
+                cmp1 = (!b6 && address_cmp) ? address_loop : address_cnt;
+                cmp2 = address_cnt;
+                int address_cnt2 = (kon || (!b6 && address_cmp)) ? cmp1 : cmp2;
 
-            address_add = (!address_cmp && b6 && !b15) || (!address_cmp && !b6);
-            address_sub = !address_cmp && b6 && b15;
-            if (b7)
-                address_cnt2 -= address_add - address_sub;
-            else
-                address_cnt2 += address_add - address_sub;
-            address_cnt = address_cnt2 & 0xfffff; // 19
-            b15 = b6 && (b15 ^ address_cmp); // 19
+                int address_add = (!address_cmp && b6 && !b15) || (!address_cmp && !b6);
+                int address_sub = !address_cmp && b6 && b15;
+                if (b7)
+                    address_cnt2 -= address_add - address_sub;
+                else
+                    address_cnt2 += address_add - address_sub;
+                address_cnt = address_cnt2 & 0xfffff; // 11
+                b15 = b6 && (b15 ^ address_cmp); // 11
 
-            int samp3 = (int8_t)PCM_ReadROMFast((hiaddr << 20) | address_cnt); // 5
+                samp1 = (int8_t)PCM_ReadROMFast((hiaddr << 20) | address_cnt); // 20
 
-            cmp1 = address;
-            cmp2 = address_cnt;
-            int nibble_cmp5 = (cmp1 & 0xffff0) == (cmp2 & 0xffff0); // 20
-            cmp1 = b15 ? address_loop : address_end;
-            cmp2 = address_cnt;
-            address_cmp = (cmp1 & 0xfffff) == (cmp2 & 0xfffff); // 21
+                cmp1 = address;
+                cmp2 = address_cnt;
+                nibble_cmp3 = (cmp1 & 0xffff0) == (cmp2 & 0xffff0); // 12
+                cmp1 = b15 ? address_loop : address_end;
+                cmp2 = address_cnt;
+                address_cmp = (cmp1 & 0xfffff) == (cmp2 & 0xfffff); // 13
 
-            if (sub_phase_of >= 3)
-            {
-                next_address = address_cnt; // 21
-                usenew = !nibble_cmp5;
-                next_b15 = b15;
-            }
+                if (sub_phase_of >= 1)
+                {
+                    next_address = address_cnt; // 13
+                    usenew = !nibble_cmp3;
+                    next_b15 = b15;
+                }
 
-            cmp1 = (!b6 && address_cmp) ? address_loop : address_cnt;
-            cmp2 = address_cnt;
-            address_cnt2 = (kon || (!b6 && address_cmp)) ? cmp1 : cmp2;
+                cmp1 = (!b6 && address_cmp) ? address_loop : address_cnt;
+                cmp2 = address_cnt;
+                address_cnt2 = (kon || (!b6 && address_cmp)) ? cmp1 : cmp2;
 
-            address_add = (!address_cmp && b6 && !b15) || (!address_cmp && !b6);
-            address_sub = !address_cmp && b6 && b15;
-            if (b7)
-                address_cnt2 -= address_add - address_sub;
-            else
-                address_cnt2 += address_add - address_sub;
-            address_cnt = address_cnt2 & 0xfffff; // 23
-            // b15 = b6 && (b15 ^ address_cmp); // 23
+                address_add = (!address_cmp && b6 && !b15) || (!address_cmp && !b6);
+                address_sub = !address_cmp && b6 && b15;
+                if (b7)
+                    address_cnt2 -= address_add - address_sub;
+                else
+                    address_cnt2 += address_add - address_sub;
+                address_cnt = address_cnt2 & 0xfffff; // 15
+                b15 = b6 && (b15 ^ address_cmp); // 15
 
-            cmp1 = address;
-            cmp2 = address_cnt;
-            int nibble_cmp6 = (cmp1 & 0xffff0) == (cmp2 & 0xffff0); // 24
+                samp2 = (int8_t)PCM_ReadROMFast((hiaddr << 20) | address_cnt); // 1
 
-            if (sub_phase_of >= 4)
-            {
-                next_address = address_cnt; // 1
-                usenew = !nibble_cmp6;
-                // b15 is not updated?
+                cmp1 = address;
+                cmp2 = address_cnt;
+                nibble_cmp4 = (cmp1 & 0xffff0) == (cmp2 & 0xffff0); // 16
+                cmp1 = b15 ? address_loop : address_end;
+                cmp2 = address_cnt;
+                address_cmp = (cmp1 & 0xfffff) == (cmp2 & 0xfffff); // 17
+
+                if (sub_phase_of >= 2)
+                {
+                    next_address = address_cnt; // 17
+                    usenew = !nibble_cmp4;
+                    next_b15 = b15;
+                }
+
+                cmp1 = (!b6 && address_cmp) ? address_loop : address_cnt;
+                cmp2 = address_cnt;
+                address_cnt2 = (kon || (!b6 && address_cmp)) ? cmp1 : cmp2;
+
+                address_add = (!address_cmp && b6 && !b15) || (!address_cmp && !b6);
+                address_sub = !address_cmp && b6 && b15;
+                if (b7)
+                    address_cnt2 -= address_add - address_sub;
+                else
+                    address_cnt2 += address_add - address_sub;
+                address_cnt = address_cnt2 & 0xfffff; // 19
+                b15 = b6 && (b15 ^ address_cmp); // 19
+
+                samp3 = (int8_t)PCM_ReadROMFast((hiaddr << 20) | address_cnt); // 5
+
+                cmp1 = address;
+                cmp2 = address_cnt;
+                nibble_cmp5 = (cmp1 & 0xffff0) == (cmp2 & 0xffff0); // 20
+                cmp1 = b15 ? address_loop : address_end;
+                cmp2 = address_cnt;
+                address_cmp = (cmp1 & 0xfffff) == (cmp2 & 0xfffff); // 21
+
+                if (sub_phase_of >= 3)
+                {
+                    next_address = address_cnt; // 21
+                    usenew = !nibble_cmp5;
+                    next_b15 = b15;
+                }
+
+                cmp1 = (!b6 && address_cmp) ? address_loop : address_cnt;
+                cmp2 = address_cnt;
+                address_cnt2 = (kon || (!b6 && address_cmp)) ? cmp1 : cmp2;
+
+                address_add = (!address_cmp && b6 && !b15) || (!address_cmp && !b6);
+                address_sub = !address_cmp && b6 && b15;
+                if (b7)
+                    address_cnt2 -= address_add - address_sub;
+                else
+                    address_cnt2 += address_add - address_sub;
+                address_cnt = address_cnt2 & 0xfffff; // 23
+                // b15 = b6 && (b15 ^ address_cmp); // 23
+
+                cmp1 = address;
+                cmp2 = address_cnt;
+                nibble_cmp6 = (cmp1 & 0xffff0) == (cmp2 & 0xffff0); // 24
+
+                if (sub_phase_of >= 4)
+                {
+                    next_address = address_cnt; // 1
+                    usenew = !nibble_cmp6;
+                    // b15 is not updated?
+                }
+
+
             }
 
             if (active && pcm.nfs)
@@ -1291,6 +1468,7 @@ void PCM_Update(uint64_t cycles)
                 ram2[8] &= ~0x8000;
                 ram2[8] |= next_b15 << 15;
             }
+
 
             // dpcm
 
@@ -1338,7 +1516,7 @@ void PCM_Update(uint64_t cycles)
 
             int test = ram1[5];
 
-            int step0 = multi(interp_lut[0][interp_ratio] << 6, samp0) >> 8;
+            int step0 = (interp_lut[0][interp_ratio] * samp0) >> 2;
             select_nibble = nibble_cmp2 ? old_nibble : newnibble;
             shift = (10 - select_nibble) & 15;
             step0 =  (step0 << 1) >> shift;
@@ -1346,14 +1524,14 @@ void PCM_Update(uint64_t cycles)
             test = addclip20(test, step0 >> 1, step0 & 1);
 
 
-            int step1 = multi(interp_lut[1][interp_ratio] << 6, samp1) >> 8;
+            int step1 = (interp_lut[1][interp_ratio] * samp1) >> 2;
             select_nibble = nibble_cmp3 ? old_nibble : newnibble;
             shift = (10 - select_nibble) & 15;
             step1 = (step1 << 1) >> shift;
 
             test = addclip20(test, step1 >> 1, step1 & 1);
 
-            int step2 = multi(interp_lut[2][interp_ratio] << 6, samp2) >> 8;
+            int step2 = (interp_lut[2][interp_ratio] * samp2) >> 2;
             select_nibble = nibble_cmp4 ? old_nibble : newnibble;
             shift = (10 - select_nibble) & 15;
             step2 = (step2 << 1) >> shift;
@@ -1434,9 +1612,18 @@ void PCM_Update(uint64_t cycles)
             int volmul1 = 0;
             int volmul2 = 0;
 
-            calc_tv(0, ram2[3], &ram2[9], active, &volmul1);
-            calc_tv(1, ram2[4], &ram2[10], active, &volmul2);
-            calc_tv(2, ram2[5], &ram2[11], active, NULL);
+            if (pcm.nfs)
+            {
+                calc_tv_fast<0>(ram2[3], &ram2[9], active, &volmul1);
+                calc_tv_fast<1>(ram2[4], &ram2[10], active, &volmul2);
+                calc_tv_fast<2>(ram2[5], &ram2[11], active, NULL);
+            }
+            else
+            {
+                calc_tv(0, ram2[3], &ram2[9], active, &volmul1);
+                calc_tv(1, ram2[4], &ram2[10], active, &volmul2);
+                calc_tv(2, ram2[5], &ram2[11], active, NULL);
+            }
 
             // if (volmul1 && volmul2)
             //     volmul1 += 0;

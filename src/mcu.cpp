@@ -157,6 +157,8 @@ static uint64_t bench_frames = 0;
 static uint32_t bench_rate = 0;
 static int bench_peak = 0;
 static FILE *bench_dump = NULL;
+static std::chrono::steady_clock::time_point bench_t0;
+static double bench_second_wall[600]; // wall time when each audio second completed
 #else
 static SDL_AudioDeviceID sdl_audio;
 #endif
@@ -1092,7 +1094,7 @@ int SDLCALL work_thread(void* data)
         // if (mcu.cycles % 24000000 == 0)
         //     printf("seconds: %i\n", (int)(mcu.cycles / 24000000));
 
-        PCM_Update(mcu.cycles);
+        if (pcm.cycles < mcu.cycles) PCM_Update(mcu.cycles);
 
         TIMER_Clock(mcu.cycles);
 
@@ -1500,7 +1502,11 @@ void MCU_PostSample(int *sample)
             int16_t out[2] = { (int16_t)(sample[0] >> 15), (int16_t)(sample[1] >> 15) };
             fwrite(out, sizeof(out), 1, bench_dump);
         }
-        if (++bench_frames >= bench_frames_target)
+        ++bench_frames;
+        if (bench_frames % bench_rate == 0 && bench_frames / bench_rate <= 600)
+            bench_second_wall[bench_frames / bench_rate - 1] =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - bench_t0).count();
+        if (bench_frames >= bench_frames_target)
             work_thread_run = false;
         return;
     }
@@ -2110,10 +2116,20 @@ int main(int argc, char *argv[])
         printf("Bench: rendering %d s at %u Hz...\n", benchSeconds, bench_rate);
         fflush(stdout);
 
-        auto t0 = std::chrono::steady_clock::now();
+        bench_t0 = std::chrono::steady_clock::now();
         work_thread_run = true;
         work_thread(NULL);
-        double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - bench_t0).count();
+
+        // Per second speed: the chord pattern starts after 2 s and all voices
+        // are busy from about 5 s on, so the later seconds are the worst case
+        printf("Bench: per second:");
+        for (int i = 0; i < benchSeconds && i < 600; i++)
+        {
+            double prev = i ? bench_second_wall[i - 1] : 0.0;
+            printf(" %.0f%%", 100.0 / (bench_second_wall[i] - prev));
+        }
+        printf("\n");
 
         double audio = (double)bench_frames / bench_rate;
         printf("Bench: %.2f s audio in %.2f s wall = %.1f%% of realtime (%s)\n",
