@@ -32,6 +32,59 @@ uint8_t waverom3[0x100000];
 uint8_t waverom_card[0x200000];
 uint8_t waverom_exp[0x800000];
 
+// PCM_ReadROM as a table: base pointer and address mask for each bank
+static const uint8_t *rom_bank_ptr[8];
+static uint32_t rom_bank_mask[8];
+static uint32_t rom_bank_shift;
+static int rom_bank_config = -1;
+static const uint8_t rom_bank_zero[1] = { 0 };
+
+static void PCM_UpdateROMBanks(void)
+{
+    int config = pcm.config_reg_3d & 0x20;
+    if (config == rom_bank_config)
+        return;
+    rom_bank_config = config;
+    rom_bank_shift = config ? 21 : 19;
+
+    for (int bank = 0; bank < 8; bank++)
+    {
+        rom_bank_ptr[bank] = rom_bank_zero;
+        rom_bank_mask[bank] = 0;
+        switch (bank)
+        {
+            case 0:
+                rom_bank_ptr[bank] = waverom1;
+                rom_bank_mask[bank] = mcu_mk1 ? 0xfffff : 0x1fffff;
+                break;
+            case 1:
+                rom_bank_ptr[bank] = waverom2;
+                rom_bank_mask[bank] = !mcu_jv880 ? 0xfffff : 0x1fffff;
+                break;
+            case 2:
+                rom_bank_ptr[bank] = mcu_jv880 ? waverom_card : waverom3;
+                rom_bank_mask[bank] = mcu_jv880 ? 0x1fffff : 0xfffff;
+                break;
+            case 3:
+            case 4:
+            case 5:
+            case 6:
+                if (mcu_jv880)
+                {
+                    rom_bank_ptr[bank] = waverom_exp + (bank - 3) * 0x200000;
+                    rom_bank_mask[bank] = 0x1fffff;
+                }
+                break;
+        }
+    }
+}
+
+static inline uint8_t PCM_ReadROMFast(uint32_t address)
+{
+    uint32_t bank = (address >> rom_bank_shift) & 7;
+    return rom_bank_ptr[bank][address & rom_bank_mask[bank]];
+}
+
 uint8_t PCM_ReadROM(uint32_t address)
 {
     int bank;
@@ -337,70 +390,18 @@ inline void calc_tv(int e, int adjust, uint16_t *levelcur, int active, int *volm
         type |= 4;
 
 
+    // addlow is 4 bits of tv_counter in reversed order; which bits and how
+    // often the level is written depends on the envelope speed type
+    static const uint8_t rev4[16] = {
+        0x0, 0x8, 0x4, 0xc, 0x2, 0xa, 0x6, 0xe, 0x1, 0x9, 0x5, 0xd, 0x3, 0xb, 0x7, 0xf
+    };
+    static const uint8_t addlow_shift[5] = { 2, 4, 6, 8, 0 };
+    static const uint8_t write_mask[5] = { 3, 15, 63, 127, 0 };
+    int sel = (type & 4) ? 4 : (type & 3);
+
     int write = !active;
-    int addlow = 0;
-    if (type & 4)
-    {
-        if (pcm.tv_counter & 8)
-            addlow |= 1;
-        if (pcm.tv_counter & 4)
-            addlow |= 2;
-        if (pcm.tv_counter & 2)
-            addlow |= 4;
-        if (pcm.tv_counter & 1)
-            addlow |= 8;
-        write |= 1;
-    }
-    else
-    {
-        switch (type & 3)
-        {
-        case 0:
-            if (pcm.tv_counter & 0x20)
-                addlow |= 1;
-            if (pcm.tv_counter & 0x10)
-                addlow |= 2;
-            if (pcm.tv_counter & 8)
-                addlow |= 4;
-            if (pcm.tv_counter & 4)
-                addlow |= 8;
-            write |= (pcm.tv_counter & 3) == 0;
-            break;
-        case 1:
-            if (pcm.tv_counter & 0x80)
-                addlow |= 1;
-            if (pcm.tv_counter & 0x40)
-                addlow |= 2;
-            if (pcm.tv_counter & 0x20)
-                addlow |= 4;
-            if (pcm.tv_counter & 0x10)
-                addlow |= 8;
-            write |= (pcm.tv_counter & 15) == 0;
-            break;
-        case 2:
-            if (pcm.tv_counter & 0x200)
-                addlow |= 1;
-            if (pcm.tv_counter & 0x100)
-                addlow |= 2;
-            if (pcm.tv_counter & 0x80)
-                addlow |= 4;
-            if (pcm.tv_counter & 0x40)
-                addlow |= 8;
-            write |= (pcm.tv_counter & 63) == 0;
-            break;
-        case 3:
-            if (pcm.tv_counter & 0x800)
-                addlow |= 1;
-            if (pcm.tv_counter & 0x400)
-                addlow |= 2;
-            if (pcm.tv_counter & 0x200)
-                addlow |= 4;
-            if (pcm.tv_counter & 0x100)
-                addlow |= 8;
-            write |= (pcm.tv_counter & 127) == 0;
-            break;
-        }
-    }
+    int addlow = rev4[(pcm.tv_counter >> addlow_shift[sel]) & 15];
+    write |= (pcm.tv_counter & write_mask[sel]) == 0;
 
     if ((type & 8) == 0)
     {
@@ -514,6 +515,7 @@ inline void eram_pack(int addr, int val)
 
 void PCM_Update(uint64_t cycles)
 {
+    PCM_UpdateROMBanks();
     int reg_slots = (pcm.config_reg_3d & 31) + 1;
     int voice_active = pcm.voice_mask & pcm.voice_mask_pending;
     while (pcm.cycles < cycles)
@@ -1137,7 +1139,7 @@ void PCM_Update(uint64_t cycles)
                 wave_address += nibble_add - nibble_subtract;
             wave_address &= 0xfffff;
 
-            int newnibble = PCM_ReadROM((hiaddr << 20) | wave_address);
+            int newnibble = PCM_ReadROMFast((hiaddr << 20) | wave_address);
             int newnibble_sel = address_b4 ^ ((b6 || !nibble_cmp1) && okey);
             if (newnibble_sel)
                 newnibble = (newnibble >> 4) & 15;
@@ -1157,7 +1159,7 @@ void PCM_Update(uint64_t cycles)
 
             // address 0
             int address_cnt = address;
-            int samp0 = (int8_t)PCM_ReadROM((hiaddr << 20) | address_cnt); // 18
+            int samp0 = (int8_t)PCM_ReadROMFast((hiaddr << 20) | address_cnt); // 18
 
             cmp1 = address;
             cmp2 = address_cnt;
@@ -1183,7 +1185,7 @@ void PCM_Update(uint64_t cycles)
             address_cnt = address_cnt2 & 0xfffff; // 11
             b15 = b6 && (b15 ^ address_cmp); // 11
 
-            int samp1 = (int8_t)PCM_ReadROM((hiaddr << 20) | address_cnt); // 20
+            int samp1 = (int8_t)PCM_ReadROMFast((hiaddr << 20) | address_cnt); // 20
 
             cmp1 = address;
             cmp2 = address_cnt;
@@ -1212,7 +1214,7 @@ void PCM_Update(uint64_t cycles)
             address_cnt = address_cnt2 & 0xfffff; // 15
             b15 = b6 && (b15 ^ address_cmp); // 15
 
-            int samp2 = (int8_t)PCM_ReadROM((hiaddr << 20) | address_cnt); // 1
+            int samp2 = (int8_t)PCM_ReadROMFast((hiaddr << 20) | address_cnt); // 1
 
             cmp1 = address;
             cmp2 = address_cnt;
@@ -1241,7 +1243,7 @@ void PCM_Update(uint64_t cycles)
             address_cnt = address_cnt2 & 0xfffff; // 19
             b15 = b6 && (b15 ^ address_cmp); // 19
 
-            int samp3 = (int8_t)PCM_ReadROM((hiaddr << 20) | address_cnt); // 5
+            int samp3 = (int8_t)PCM_ReadROMFast((hiaddr << 20) | address_cnt); // 5
 
             cmp1 = address;
             cmp2 = address_cnt;

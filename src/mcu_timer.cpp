@@ -202,134 +202,190 @@ uint8_t TIMER_Read2(uint32_t address)
     return 0xff;
 }
 
+// Number of k in [from, to) with k % (1 << shift) == 0
+static inline uint32_t TIMER_Ticks(uint64_t from, uint64_t to, uint32_t shift)
+{
+    uint64_t mask = ((uint64_t)1 << shift) - 1;
+    return (uint32_t)(((to + mask) >> shift) - ((from + mask) >> shift));
+}
+
+static void TIMER_StepFRT(uint32_t i)
+{
+    frt_t *timer = &frt[i];
+
+    uint32_t value = timer->frc;
+    uint32_t matcha = value == timer->ocra;
+    uint32_t matchb = value == timer->ocrb;
+    if ((timer->tcsr & 1) != 0 && matcha) // CCLRA
+        value = 0;
+    else
+        value++;
+    uint32_t of = (value >> 16) & 1;
+    value &= 0xffff;
+    timer->frc = value;
+
+    // flags
+    if (of)
+        timer->tcsr |= 0x10;
+    if (matcha)
+        timer->tcsr |= 0x20;
+    if (matchb)
+        timer->tcsr |= 0x40;
+}
+
+static void TIMER_Step8(void)
+{
+    uint32_t value = timer.tcnt;
+    uint32_t matcha = value == timer.tcora;
+    uint32_t matchb = value == timer.tcorb;
+    if ((timer.tcr & 24) == 8 && matcha)
+        value = 0;
+    else if ((timer.tcr & 24) == 16 && matchb)
+        value = 0;
+    else
+        value++;
+    uint32_t of = (value >> 8) & 1;
+    value &= 0xff;
+    timer.tcnt = value;
+
+    // flags
+    if (of)
+        timer.tcsr |= 0x20;
+    if (matcha)
+        timer.tcsr |= 0x40;
+    if (matchb)
+        timer.tcsr |= 0x80;
+}
+
+// Advances the timers to cycles/2 in one go. Same result as stepping one
+// timer clock at a time: when no compare match or overflow can happen within
+// the step the counter is just advanced, otherwise it is stepped tick by
+// tick. The interrupt requests are only ever set to 1 here, so asserting them
+// once after a step is the same as asserting them on every tick.
 void TIMER_Clock(uint64_t cycles)
 {
+    uint64_t from = timer_cycles;
+    uint64_t to = (cycles + 1) / 2; // FIXME
+    if (to <= from)
+        return;
+    timer_cycles = to;
+
     uint32_t i;
-    while (timer_cycles*2 < cycles) // FIXME
+    for (i = 0; i < 3; i++)
     {
-        for (i = 0; i < 3; i++)
+        frt_t *timer = &frt[i];
+        uint32_t shift = 0;
+
+        switch (timer->tcr & 3)
         {
-            frt_t *timer = &frt[i];
-            uint32_t offset = 0x10 * i;
-
-            switch (timer->tcr & 3)
-            {
-            case 0: // o / 4
-                if (timer_cycles & 3)
-                    continue;
-                break;
-            case 1: // o / 8
-                if (timer_cycles & 7)
-                    continue;
-                break;
-            case 2: // o / 32
-                if (timer_cycles & 31)
-                    continue;
-                break;
-            case 3: // ext (o / 2)
-                if (mcu_mk1)
-                {
-                    if (timer_cycles & 3)
-                        continue;
-                }
-                else
-                {
-                    if (timer_cycles & 1)
-                        continue;
-                }
-                break;
-            }
-
-            uint32_t value = timer->frc;
-            uint32_t matcha = value == timer->ocra;
-            uint32_t matchb = value == timer->ocrb;
-            if ((timer->tcsr & 1) != 0 && matcha) // CCLRA
-                value = 0;
-            else
-                value++;
-            uint32_t of = (value >> 16) & 1;
-            value &= 0xffff;
-            timer->frc = value;
-
-            // flags
-            if (of)
-                timer->tcsr |= 0x10;
-            if (matcha)
-                timer->tcsr |= 0x20;
-            if (matchb)
-                timer->tcsr |= 0x40;
-            if ((timer->tcr & 0x10) != 0 && (timer->tcsr & 0x10) != 0)
-                MCU_Interrupt_SetRequest(INTERRUPT_SOURCE_FRT0_FOVI + i * 4, 1);
-            if ((timer->tcr & 0x20) != 0 && (timer->tcsr & 0x20) != 0)
-                MCU_Interrupt_SetRequest(INTERRUPT_SOURCE_FRT0_OCIA + i * 4, 1);
-            if ((timer->tcr & 0x40) != 0 && (timer->tcsr & 0x40) != 0)
-                MCU_Interrupt_SetRequest(INTERRUPT_SOURCE_FRT0_OCIB + i * 4, 1);
-        }
-
-        int32_t timer_step = 0;
-
-        switch (timer.tcr & 7)
-        {
-        case 0:
-        case 4:
+        case 0: // o / 4
+            shift = 2;
             break;
         case 1: // o / 8
-            if ((timer_cycles & 7) == 0)
-                timer_step = 1;
+            shift = 3;
             break;
-        case 2: // o / 64
-            if ((timer_cycles & 63) == 0)
-                timer_step = 1;
+        case 2: // o / 32
+            shift = 5;
             break;
-        case 3: // o / 1024
-            if ((timer_cycles & 1023) == 0)
-                timer_step = 1;
-            break;
-        case 5:
-        case 6:
-        case 7: // ext (o / 2)
-            if (mcu_mk1)
-            {
-                if ((timer_cycles & 3) == 0)
-                    timer_step = 1;
-            }
-            else
-            {
-                if ((timer_cycles & 1) == 0)
-                    timer_step = 1;
-            }
+        case 3: // ext (o / 2)
+            shift = mcu_mk1 ? 2 : 1;
             break;
         }
-        if (timer_step)
+
+        uint32_t n = TIMER_Ticks(from, to, shift);
+        if (n == 0)
+            continue;
+
+        uint32_t value = timer->frc;
+        uint32_t last = value + n - 1; // last value compared
+        if (last < 0xffff
+            && (timer->ocra < value || timer->ocra > last)
+            && (timer->ocrb < value || timer->ocrb > last))
         {
-            uint32_t value = timer.tcnt;
-            uint32_t matcha = value == timer.tcora;
-            uint32_t matchb = value == timer.tcorb;
-            if ((timer.tcr & 24) == 8 && matcha)
-                value = 0;
-            else if ((timer.tcr & 24) == 16 && matchb)
-                value = 0;
-            else
-                value++;
-            uint32_t of = (value >> 8) & 1;
-            value &= 0xff;
-            timer.tcnt = value;
-
-            // flags
-            if (of)
-                timer.tcsr |= 0x20;
-            if (matcha)
-                timer.tcsr |= 0x40;
-            if (matchb)
-                timer.tcsr |= 0x80;
-            if ((timer.tcr & 0x20) != 0 && (timer.tcsr & 0x20) != 0)
-                MCU_Interrupt_SetRequest(INTERRUPT_SOURCE_TIMER_OVI, 1);
-            if ((timer.tcr & 0x40) != 0 && (timer.tcsr & 0x40) != 0)
-                MCU_Interrupt_SetRequest(INTERRUPT_SOURCE_TIMER_CMIA, 1);
-            if ((timer.tcr & 0x80) != 0 && (timer.tcsr & 0x80) != 0)
-                MCU_Interrupt_SetRequest(INTERRUPT_SOURCE_TIMER_CMIB, 1);
+            timer->frc = value + n;
+        }
+        else
+        {
+            for (uint32_t k = 0; k < n; k++)
+                TIMER_StepFRT(i);
         }
 
-        timer_cycles++;
+        if ((timer->tcr & 0x10) != 0 && (timer->tcsr & 0x10) != 0)
+            MCU_Interrupt_SetRequest(INTERRUPT_SOURCE_FRT0_FOVI + i * 4, 1);
+        if ((timer->tcr & 0x20) != 0 && (timer->tcsr & 0x20) != 0)
+            MCU_Interrupt_SetRequest(INTERRUPT_SOURCE_FRT0_OCIA + i * 4, 1);
+        if ((timer->tcr & 0x40) != 0 && (timer->tcsr & 0x40) != 0)
+            MCU_Interrupt_SetRequest(INTERRUPT_SOURCE_FRT0_OCIB + i * 4, 1);
+    }
+
+    uint32_t shift = 0;
+
+    switch (timer.tcr & 7)
+    {
+    case 0:
+    case 4:
+        break;
+    case 1: // o / 8
+        shift = 3;
+        break;
+    case 2: // o / 64
+        shift = 6;
+        break;
+    case 3: // o / 1024
+        shift = 10;
+        break;
+    case 5:
+    case 6:
+    case 7: // ext (o / 2)
+        shift = mcu_mk1 ? 2 : 1;
+        break;
+    }
+
+    uint32_t n = shift ? TIMER_Ticks(from, to, shift) : 0;
+    if (n)
+    {
+        uint32_t value = timer.tcnt;
+        uint32_t last = value + n - 1; // last value compared
+        uint32_t clear = 0x100; // counter is cleared after reaching this value
+        if ((timer.tcr & 24) == 8)
+            clear = timer.tcora;
+        else if ((timer.tcr & 24) == 16)
+            clear = timer.tcorb;
+
+        if (last < 0xff
+            && (timer.tcora < value || timer.tcora > last)
+            && (timer.tcorb < value || timer.tcorb > last))
+        {
+            timer.tcnt = value + n;
+        }
+        else if (clear < 0x100 && value <= clear)
+        {
+            // Periodic: counts value, value + 1, ... clear, 0, 1, ... and
+            // never overflows. A compare value is matched if it is reached
+            // within the n compared values.
+            uint32_t period = clear + 1;
+            uint32_t da = timer.tcora >= value ? timer.tcora - value : timer.tcora + period - value;
+            uint32_t db = timer.tcorb >= value ? timer.tcorb - value : timer.tcorb + period - value;
+            if (timer.tcora <= clear && da < n)
+                timer.tcsr |= 0x40;
+            if (timer.tcorb <= clear && db < n)
+                timer.tcsr |= 0x80;
+            uint32_t next = value + n;
+            while (next >= period)
+                next -= period;
+            timer.tcnt = next;
+        }
+        else
+        {
+            for (uint32_t k = 0; k < n; k++)
+                TIMER_Step8();
+        }
+
+        if ((timer.tcr & 0x20) != 0 && (timer.tcsr & 0x20) != 0)
+            MCU_Interrupt_SetRequest(INTERRUPT_SOURCE_TIMER_OVI, 1);
+        if ((timer.tcr & 0x40) != 0 && (timer.tcsr & 0x40) != 0)
+            MCU_Interrupt_SetRequest(INTERRUPT_SOURCE_TIMER_CMIA, 1);
+        if ((timer.tcr & 0x80) != 0 && (timer.tcsr & 0x80) != 0)
+            MCU_Interrupt_SetRequest(INTERRUPT_SOURCE_TIMER_CMIB, 1);
     }
 }

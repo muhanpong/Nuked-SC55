@@ -172,6 +172,8 @@ struct mcu_t {
     int32_t exception_pending;
     uint8_t interrupt_pending[INTERRUPT_SOURCE_MAX];
     uint8_t trapa_pending[16];
+    uint32_t interrupt_pending_count; // nonzero entries of interrupt_pending
+    uint32_t trapa_pending_count; // nonzero entries of trapa_pending
     uint64_t cycles;
 };
 

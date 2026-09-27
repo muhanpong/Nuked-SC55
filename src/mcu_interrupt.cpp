@@ -34,6 +34,7 @@ void MCU_Interrupt_Start(int32_t mask)
 
 void MCU_Interrupt_SetRequest(uint32_t interrupt, uint32_t value)
 {
+    mcu.interrupt_pending_count += (value != 0) - (mcu.interrupt_pending[interrupt] != 0);
     mcu.interrupt_pending[interrupt] = value;
 }
 
@@ -50,6 +51,7 @@ void MCU_Interrupt_Exception(uint32_t exception)
 
 void MCU_Interrupt_TRAPA(uint32_t vector)
 {
+    mcu.trapa_pending_count += !mcu.trapa_pending[vector];
     mcu.trapa_pending[vector] = 1;
 }
 
@@ -80,12 +82,17 @@ void MCU_Interrupt_Handle(void)
         return;
     }
 #endif
+    // Nothing pending: the scans below would find nothing
+    if (!mcu.trapa_pending_count && mcu.exception_pending < 0 && !mcu.interrupt_pending_count)
+        return;
+
     uint32_t i;
-    for (i = 0; i < 16; i++)
+    for (i = 0; i < 16 && mcu.trapa_pending_count; i++)
     {
         if (mcu.trapa_pending[i])
         {
             mcu.trapa_pending[i] = 0;
+            mcu.trapa_pending_count--;
             MCU_Interrupt_StartVector(VECTOR_TRAPA_0 + i, -1);
             return;
         }
