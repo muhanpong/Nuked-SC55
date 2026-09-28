@@ -21,6 +21,7 @@
 #ifdef NUKED_HEADLESS
 #include <stdlib.h>
 #include <signal.h>
+#include <sys/time.h>
 #include <atomic>
 #include <chrono>
 #include <mutex>
@@ -159,6 +160,72 @@ static int bench_peak = 0;
 static FILE *bench_dump = NULL;
 static std::chrono::steady_clock::time_point bench_t0;
 static double bench_second_wall[600]; // wall time when each audio second completed
+
+// -benchprof: statistical profile by section. The main loop stores the
+// section it is in; a SIGPROF timer samples it, bucketed by audio second.
+enum {
+    PROF_OTHER, PROF_INTERRUPT, PROF_EXEC, PROF_PCM, PROF_TIMER, PROF_SUBMCU, PROF_ANALOG,
+    PROF_COUNT
+};
+static const char *prof_names[PROF_COUNT] = {
+    "other", "mcu interrupt", "mcu exec", "pcm", "timer", "sub mcu", "analog/misc"
+};
+static volatile int prof_section = PROF_OTHER;
+static volatile uint32_t prof_counts[600][PROF_COUNT];
+static bool prof_enabled = false;
+#define PROF_SET(s) prof_section = (s)
+
+static void prof_handler(int /*sig*/)
+{
+    uint64_t sec = bench_rate ? bench_frames / bench_rate : 0;
+    if (sec < 600)
+        prof_counts[sec][prof_section]++;
+}
+
+static void prof_start(void)
+{
+    struct sigaction sa = {};
+    sa.sa_handler = prof_handler;
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGPROF, &sa, NULL);
+    struct itimerval it = {};
+    it.it_interval.tv_usec = 1000; // rounded up to the kernel tick
+    it.it_value.tv_usec = 1000;
+    setitimer(ITIMER_PROF, &it, NULL);
+}
+
+static void prof_report(int seconds)
+{
+    struct itimerval it = {};
+    setitimer(ITIMER_PROF, &it, NULL);
+
+    printf("Bench: profile (%% of samples per audio second)\n");
+    printf("%14s", "");
+    for (int s = 0; s < seconds && s < 600; s++)
+        printf("%6d", s + 1);
+    printf("\n");
+    for (int p = 0; p < PROF_COUNT; p++)
+    {
+        printf("%14s", prof_names[p]);
+        for (int s = 0; s < seconds && s < 600; s++)
+        {
+            uint32_t total = 0;
+            for (int q = 0; q < PROF_COUNT; q++)
+                total += prof_counts[s][q];
+            printf("%5.1f%%", total ? 100.0 * prof_counts[s][p] / total : 0.0);
+        }
+        printf("\n");
+    }
+    printf("%14s", "samples");
+    for (int s = 0; s < seconds && s < 600; s++)
+    {
+        uint32_t total = 0;
+        for (int q = 0; q < PROF_COUNT; q++)
+            total += prof_counts[s][q];
+        printf("%6u", total);
+    }
+    printf("\n");
+}
 #else
 static SDL_AudioDeviceID sdl_audio;
 #endif
@@ -1055,6 +1122,8 @@ static void MCU_Sleep(int ms)
     SDL_Delay(ms);
 }
 
+#define PROF_SET(s)
+
 int SDLCALL work_thread(void* data)
 {
     work_thread_lock = SDL_CreateMutex();
@@ -1081,11 +1150,13 @@ int SDLCALL work_thread(void* data)
             MCU_WorkThread_Lock();
         }
 
+        PROF_SET(PROF_INTERRUPT);
         if (!mcu.ex_ignore)
             MCU_Interrupt_Handle();
         else
             mcu.ex_ignore = 0;
 
+        PROF_SET(PROF_EXEC);
         if (!mcu.sleep)
             MCU_ReadInstruction();
 
@@ -1094,10 +1165,13 @@ int SDLCALL work_thread(void* data)
         // if (mcu.cycles % 24000000 == 0)
         //     printf("seconds: %i\n", (int)(mcu.cycles / 24000000));
 
+        PROF_SET(PROF_PCM);
         if (pcm.cycles < mcu.cycles) PCM_Update(mcu.cycles);
 
+        PROF_SET(PROF_TIMER);
         TIMER_Clock(mcu.cycles);
 
+        PROF_SET(PROF_SUBMCU);
         if (!mcu_mk1 && !mcu_jv880 && !mcu_scb55)
             SM_Update(mcu.cycles);
         else
@@ -1106,6 +1180,7 @@ int SDLCALL work_thread(void* data)
             MCU_UpdateUART_TX();
         }
 
+        PROF_SET(PROF_ANALOG);
         MCU_UpdateAnalog(mcu.cycles);
 
         if (mcu_mk1)
@@ -1735,6 +1810,10 @@ int main(int argc, char *argv[])
             {
                 bench_dump = fopen(argv[i] + 11, "wb");
             }
+            else if (!strcmp(argv[i], "-benchprof"))
+            {
+                prof_enabled = true;
+            }
 #endif
             else if (!strncmp(argv[i], "-a:", 3))
             {
@@ -1817,6 +1896,7 @@ int main(int argc, char *argv[])
                 printf("  -ini:<file>                    Set config file (default: " NUKED_DEFAULT_INI ").\n");
                 printf("  -bench:<seconds>               Render <seconds> of audio without output and report speed.\n");
                 printf("  -benchdump:<file>              With -bench, also write the raw S16 stereo output to <file>.\n");
+                printf("  -benchprof                     With -bench, print a per-section time profile.\n");
 #endif
 #ifdef NUKED_HEADLESS
                 printf("  -ad:<alsa_device>              Set ALSA output device (default: \"default\").\n");
@@ -2117,9 +2197,13 @@ int main(int argc, char *argv[])
         fflush(stdout);
 
         bench_t0 = std::chrono::steady_clock::now();
+        if (prof_enabled)
+            prof_start();
         work_thread_run = true;
         work_thread(NULL);
         double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - bench_t0).count();
+        if (prof_enabled)
+            prof_report(benchSeconds);
 
         // Per second speed: the chord pattern starts after 2 s and all voices
         // are busy from about 5 s on, so the later seconds are the worst case
